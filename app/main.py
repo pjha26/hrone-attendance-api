@@ -59,7 +59,19 @@ async def lifespan(app):
         client.close()
 
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan,
+    description="Manage attendance, correct records with an audit trail, and explore MongoDB analytics. "
+                "Instants use integer epoch milliseconds; dates and shift times use IST. "
+                "Start by creating an employee, then record a punch-in and punch-out.",
+    openapi_tags=[
+        {"name": "system", "description": "Check database readiness."},
+        {"name": "employees", "description": "Create employees and browse filtered pages."},
+        {"name": "attendance", "description": "Record punches, browse attendance, and make audited corrections."},
+        {"name": "analytics", "description": "Monthly summaries, late rankings, and daily department trends."},
+        {"name": "admin", "description": "Inspect the execution plans used by list and analytics queries."},
+    ],
+)
 
 
 @app.exception_handler(PyMongoError)
@@ -100,6 +112,10 @@ class RequestBody(BaseModel):
 
 
 class EmployeeIn(RequestBody):
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "emp_code": "EMP0001", "name": "Test Employee", "email": "test@example.com",
+        "department": "Engineering", "shift_start": "09:30", "shift_end": "18:30", "joined_on": "2026-07-01",
+    }]})
     emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
     name: str = Field(min_length=1, max_length=100)
     email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -116,20 +132,152 @@ class EmployeeIn(RequestBody):
 
 
 class PunchOutIn(RequestBody):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"emp_code": "EMP0001", "punched_at": 1783345200000}]})
     emp_code: str
     punched_at: EpochMillis | SkipJsonSchema[None] = None
 
 
 class PunchInIn(PunchOutIn):
+    model_config = ConfigDict(json_schema_extra={"examples": [{"emp_code": "EMP0001", "punched_at": 1783312500000, "status": "PRESENT"}]})
     status: PresenceStatus = "PRESENT"
 
 
 class RegularizeIn(RequestBody):
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "punch_in": 1783310280000, "reason": "Corrected biometric clock entry", "regularized_by": "hr.admin",
+    }]})
     status: Status | SkipJsonSchema[None] = None
     punch_in: EpochMillis | SkipJsonSchema[None] = None
     punch_out: EpochMillis | SkipJsonSchema[None] = None
     reason: str = Field(min_length=5, max_length=200)
     regularized_by: str = Field(min_length=1, max_length=50)
+
+
+# These models describe responses in OpenAPI; serializers still control runtime output.
+class HealthOut(BaseModel):
+    status: Literal["ok"]
+
+
+class ErrorOut(BaseModel):
+    detail: str
+
+
+NOT_FOUND = {"model": ErrorOut, "description": "Employee, attendance record, or department not found."}
+CONFLICT = {"model": ErrorOut, "description": "Duplicate record, already closed attendance, or a concurrent update."}
+UNAVAILABLE = {"model": ErrorOut, "description": "MongoDB is unavailable."}
+
+
+class EmployeeOut(BaseModel):
+    emp_code: str
+    name: str
+    email: str
+    department: str
+    shift_start: str
+    shift_end: str
+    joined_on: str
+    created_at: EpochMillis
+
+
+class EmployeePageOut(BaseModel):
+    items: list[EmployeeOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class FieldChangeOut(BaseModel):
+    previous: str | int | float | bool | None = Field(alias="from")
+    to: str | int | float | bool | None
+
+
+class HistoryOut(BaseModel):
+    at: EpochMillis
+    by: str
+    reason: str
+    changes: dict[str, FieldChangeOut]
+
+
+class AttendanceOut(BaseModel):
+    emp_code: str
+    date: str
+    status: Status
+    punch_in: EpochMillis | None
+    punch_out: EpochMillis | None
+    work_hours: float | None
+    late_minutes: int
+    overtime_minutes: int
+    half_day: bool
+    history: list[HistoryOut]
+
+
+class AttendancePageOut(BaseModel):
+    items: list[AttendanceOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class EmployeeMonthlyOut(BaseModel):
+    emp_code: str
+    month: str
+    working_days: int
+    present_days: float
+    leave_days: int
+    late_count: int
+    total_late_minutes: int
+    total_overtime_minutes: int
+    attendance_pct: float | None
+
+
+class DepartmentItemOut(BaseModel):
+    department: str
+    headcount: int
+    present_days: float
+    avg_work_hours: float | None
+    late_count: int
+    total_late_minutes: int
+    leave_count: int
+    on_duty_count: int
+
+
+class DepartmentSummaryOut(BaseModel):
+    month: str
+    items: list[DepartmentItemOut]
+
+
+class LeaderboardItemOut(BaseModel):
+    rank: int
+    emp_code: str
+    name: str
+    department: str
+    total_late_minutes: int
+    late_count: int
+
+
+class LeaderboardOut(BaseModel):
+    month: str
+    items: list[LeaderboardItemOut]
+
+
+class TrendItemOut(BaseModel):
+    date: str
+    is_working_day: bool
+    headcount: int
+    present_count: float
+    late_count: int
+    attendance_rate: float | None
+    moving_avg_7d: float | None
+
+
+class TrendOut(BaseModel):
+    department: str
+    items: list[TrendItemOut]
+
+
+class ExplainOut(BaseModel):
+    endpoint: str
+    collection: str
+    explain: dict
 
 
 def invalid(message, location="body"):
@@ -213,8 +361,10 @@ def derived_fields(state, employee, day):
     return result
 
 
-@app.get("/health")
+@app.get("/health", tags=["system"], operation_id="health", summary="Check database readiness",
+         responses={200: {"model": HealthOut}, 503: UNAVAILABLE})
 def health():
+    """Return ready only when MongoDB responds to a ping."""
     try:
         db.command("ping")
     except PyMongoError:
@@ -282,8 +432,10 @@ def truncate_punches(state):
             state[key] = state[key].replace(microsecond=0)
 
 
-@app.post("/employees", status_code=201)
+@app.post("/employees", status_code=201, tags=["employees"], operation_id="createEmployee", summary="Create an employee",
+          responses={201: {"model": EmployeeOut}, 409: CONFLICT, 503: UNAVAILABLE})
 def create_employee(body: EmployeeIn):
+    """Supply the customer's unique employee code. The server sets created_at; duplicate codes return 409."""
     doc = body.model_dump()
     doc["created_at"] = now_utc()
     try:
@@ -293,8 +445,10 @@ def create_employee(body: EmployeeIn):
     return employee_output(doc)
 
 
-@app.get("/employees")
+@app.get("/employees", tags=["employees"], operation_id="listEmployees", summary="List employees",
+         responses={200: {"model": EmployeePageOut}, 503: UNAVAILABLE})
 def list_employees(department: str | None = None, page: Page = 1, page_size: PageSize = 20):
+    """Filter by an exact department name. Pages are ordered by employee code; total counts the filtered set."""
     query = {} if department is None else {"department": department}
     hint = "employee_code" if department is None else "employee_department_code"
     total = db.employees.count_documents(query, hint=hint)
@@ -302,8 +456,10 @@ def list_employees(department: str | None = None, page: Page = 1, page_size: Pag
     return {"items": [employee_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
 
 
-@app.post("/attendance/punch-in", status_code=201)
+@app.post("/attendance/punch-in", status_code=201, tags=["attendance"], operation_id="punchIn", summary="Record a punch-in",
+          responses={201: {"model": AttendanceOut}, 404: NOT_FOUND, 409: CONFLICT, 503: UNAVAILABLE})
 def punch_in(body: PunchInIn):
+    """Omit punched_at to use now. The IST shift determines the date; only one record per employee/day is allowed."""
     employee = employee_or_404(body.emp_code)
     punch = instant(body.punched_at)
     day = attendance_date(punch, employee)
@@ -316,19 +472,23 @@ def punch_in(body: PunchInIn):
     return attendance_output(doc)
 
 
-@app.get("/attendance")
+@app.get("/attendance", tags=["attendance"], operation_id="listAttendance", summary="List attendance records",
+         responses={200: {"model": AttendancePageOut}, 503: UNAVAILABLE})
 def list_attendance(
     emp_code: str | None = None, date_from: DateText | None = None, date_to: DateText | None = None,
     status: Status | None = None, page: Page = 1, page_size: PageSize = 20,
 ):
+    """Dates are inclusive. Results are sorted by date descending, then employee code ascending."""
     command = attendance_find_command(emp_code, date_from, date_to, status, page, page_size)
     total = db.attendance_logs.count_documents(command["filter"], hint=command["hint"])
     docs = db.attendance_logs.find(command["filter"], command["projection"]).hint(command["hint"]).sort(list(command["sort"].items())).skip(command["skip"]).limit(command["limit"])
     return {"items": [attendance_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
 
 
-@app.post("/attendance/punch-out")
+@app.post("/attendance/punch-out", tags=["attendance"], operation_id="punchOut", summary="Record a punch-out",
+          responses={200: {"model": AttendanceOut}, 404: NOT_FOUND, 409: CONFLICT, 503: UNAVAILABLE})
 def punch_out(body: PunchOutIn):
+    """Close the latest eligible punch-in, including overnight shifts. The duration must be positive and at most 24 hours."""
     employee = employee_or_404(body.emp_code)
     punch = instant(body.punched_at)
     doc = db.attendance_logs.find_one(
@@ -350,8 +510,11 @@ def punch_out(body: PunchOutIn):
     return attendance_output(updated)
 
 
-@app.patch("/attendance/{emp_code}/{date}")
+@app.patch("/attendance/{emp_code}/{date}", tags=["attendance"], operation_id="regularizeAttendance",
+           summary="Correct a day's attendance",
+           responses={200: {"model": AttendanceOut}, 404: NOT_FOUND, 409: CONFLICT, 503: UNAVAILABLE})
 def regularize(emp_code: str, date: DateText, body: RegularizeIn):
+    """Omitted fields stay unchanged. Recompute derived values and append one audit entry; a no-op returns 422."""
     employee = employee_or_404(emp_code)
     doc = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
     if doc is None:
@@ -572,26 +735,35 @@ def aggregate(endpoint, **parameters):
     return list(db[collection].aggregate(pipeline, hint=hint))
 
 
-@app.get("/analytics/employees/{emp_code}/monthly")
+@app.get("/analytics/employees/{emp_code}/monthly", tags=["analytics"], operation_id="employeeMonthly",
+         summary="Get an employee's monthly summary",
+         responses={200: {"model": EmployeeMonthlyOut}, 404: NOT_FOUND, 503: UNAVAILABLE})
 def employee_monthly(emp_code: str, month: MonthText):
+    """Use YYYY-MM. Weekday presence includes half-day weights; late and overtime totals include weekends."""
     rows = aggregate("employee_monthly", emp_code=emp_code, month=month)
     if not rows:
         raise HTTPException(404, "Employee not found")
     return json_value(rows[0])
 
 
-@app.get("/analytics/departments/summary")
+@app.get("/analytics/departments/summary", tags=["analytics"], operation_id="departmentSummary",
+         summary="Get monthly department summaries", responses={200: {"model": DepartmentSummaryOut}, 503: UNAVAILABLE})
 def department_summary(month: MonthText, department: str | None = None):
+    """Include eligible employees without logs. Average work hours over completed presence records, not employee averages."""
     return {"month": month, "items": json_value(aggregate("department_summary", month=month, department=department))}
 
 
-@app.get("/analytics/leaderboard/late")
+@app.get("/analytics/leaderboard/late", tags=["analytics"], operation_id="lateLeaderboard",
+         summary="Rank employees by late minutes", responses={200: {"model": LeaderboardOut}, 503: UNAVAILABLE})
 def late_leaderboard(month: MonthText, limit: Limit = 10, department: str | None = None):
+    """Competition ranks are 1, 2, 2, 4. Return rank <= limit, including cutoff ties; filter department before ranking."""
     return {"month": month, "items": json_value(aggregate("late_leaderboard", month=month, limit=limit, department=department))}
 
 
-@app.get("/analytics/departments/{department}/trend")
+@app.get("/analytics/departments/{department}/trend", tags=["analytics"], operation_id="departmentTrend",
+         summary="Get a department's daily trend", responses={200: {"model": TrendOut}, 404: NOT_FOUND, 503: UNAVAILABLE})
 def department_trend(department: str, first: Annotated[DateText, Query(alias="from")], last: Annotated[DateText, Query(alias="to")]):
+    """Request up to 92 inclusive dates. Include gaps and weekends; the seven-day average excludes null rates."""
     rows = aggregate("department_trend", department=department, first=first, last=last)
     if not rows:
         raise HTTPException(404, "Department not found")
@@ -601,7 +773,8 @@ def department_trend(department: str, first: Annotated[DateText, Query(alias="fr
 ExplainEndpoint = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
 
 
-@app.get("/admin/explain/{endpoint}")
+@app.get("/admin/explain/{endpoint}", tags=["admin"], operation_id="explainEndpoint", summary="Inspect a MongoDB execution plan",
+         responses={200: {"model": ExplainOut}, 503: UNAVAILABLE})
 def explain_endpoint(
     endpoint: ExplainEndpoint, emp_code: str | None = None, month: MonthText | None = None,
     department: str | None = None, limit: Limit = 10,
@@ -610,6 +783,7 @@ def explain_endpoint(
     last: Annotated[DateText | None, Query(alias="to")] = None,
     page: Page = 1, page_size: PageSize = 20,
 ):
+    """Use the chosen endpoint's filters. Return its actual query/pipeline executionStats; BSON metadata uses Extended JSON."""
     if endpoint == "attendance_list":
         collection = "attendance_logs"
         command = attendance_find_command(emp_code, date_from, date_to, status, page, page_size)

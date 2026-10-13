@@ -1,11 +1,11 @@
 # Design decisions
 
-1. **Indexes.** Unique employee codes and employee/date pairs enforce identity and one attendance record per day. Employee department/code supports sorted lists; join-date/department and department/join-date support eligible headcount. Attendance date/code supports global lists and monthly ranges, employee/punch supports punch-out, and status/date/code supports status-filtered pages. I rejected a history index because no endpoint searches history.
+1. **Indexes.** Unique indexes on `emp_code` and `(emp_code, date)` prevent duplicates. Employee indexes on `(department, emp_code)`, `(joined_on, department)` and `(department, joined_on)` support sorted lists and eligible headcounts. Attendance indexes on `(date, emp_code)`, `(emp_code, punch_in)` and `(status, date, emp_code)` support monthly queries, latest punch-in lookup and filtered pages. I skipped a history index because nothing queries it.
 
-2. **Punch-in race.** Both requests resolve the employee and compute the attendance date. Both attempt an insert. MongoDB's unique employee/date index permits one write; that request returns 201. The other insert raises DuplicateKeyError and returns 409. A preliminary read cannot guarantee this outcome.
+2. **Punch-in race.** Both requests find the employee, calculate the IST attendance date and try to insert. The unique employee/date index lets one succeed with 201. MongoDB rejects the duplicate; the code catches DuplicateKeyError and returns 409.
 
-3. **Ties.** The database computes competition ranks before filtering rank <= limit. Everyone tied at an included rank is returned, even when the response exceeds limit rows. Employee code orders tied rows afterward.
+3. **Ties.** I filter by rank <= limit, so both tied employees are returned, even if that exceeds limit rows. Competition ranks can be 1, 2, 2, 4. Employee code gives tied rows a stable order.
 
-4. **Headcount.** Department summary starts with eligible employees, then looks up each employee's monthly totals. An empty lookup contributes zero attendance but still one employee. Work-hour averages divide record sums by record counts.
+4. **Headcount.** I start with employees who joined by month-end, then look up attendance. Someone with no logs still counts in headcount. Average hours use record totals and counts, rather than averaging each employee's average.
 
-5. **100x data.** I would consider daily summary documents after profiling. Corrections would update the affected summaries consistently; otherwise faster reads could silently report stale attendance.
+5. **100x data.** I would profile the slow queries first, then add daily summaries if needed. Corrections would also update those summaries so analytics stayed accurate.

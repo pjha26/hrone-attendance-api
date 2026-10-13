@@ -23,7 +23,7 @@ def test_strict_supplied_timestamps(value):
 
 @pytest.mark.parametrize("time_text,expected", [("09:40:00.900", 0), ("09:40:01", 10), ("10:15:59", 45)])
 def test_grace_is_checked_in_seconds(time_text, expected):
-    punch = instant(epoch_millis(local("2026-07-06T" + time_text)))
+    punch = instant(int(local("2026-07-06T" + time_text).timestamp() * 1000))
     assert punch.microsecond == 0
     state = {"status": "PRESENT", "punch_in": punch, "punch_out": None}
     assert derived_fields(state, DAY_SHIFT, "2026-07-06")["late_minutes"] == expected
@@ -67,7 +67,7 @@ def test_serialization_nested_dates_and_legacy_defaults():
 def test_contract_validation_and_ignored_derived_fields():
     employee = dict(emp_code="EMP0001", name="A", email="a@example.com", department="Eng", joined_on="2026-07-01")
     assert EmployeeIn(**employee).shift_start == "09:30"
-    for changes in ({"joined_on": "2026-02-30"}, {"shift_end": "09:30"}, {"emp_code": "EMP1"}, {"email": "bad"}):
+    for changes in ({"joined_on": "2026-02-30"}, {"shift_end": "09:30"}, {"emp_code": "EMP1"}, {"email": "bad"}, {"shift_start": "0\u0669:3\u0660"}):
         with pytest.raises(ValidationError):
             EmployeeIn(**(employee | changes))
     body = PunchInIn(emp_code="EMP0001", late_minutes=999)

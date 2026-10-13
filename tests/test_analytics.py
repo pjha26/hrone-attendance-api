@@ -96,3 +96,20 @@ def test_empty_trend_future_joiners_and_range_validation(api, database):
         assert api.get("/analytics/departments/Eng/trend", params={"from": first, "to": last}).status_code == 422
     assert api.get("/analytics/departments/unknown/trend", params={"from": "2026-07-01", "to": "2026-07-01"}).status_code == 404
     assert api.get("/analytics/departments/summary", params={"month": "2026-13"}).status_code == 422
+
+
+def test_leap_month_and_extreme_calendar_years(api, database):
+    emp(database, "EMP0001", joined="2024-02-01")
+    assert get(api, "/analytics/employees/EMP0001/monthly", month="2024-02")["working_days"] == 21
+    assert get(api, "/analytics/employees/EMP0001/monthly", month="0001-01")["working_days"] == 0
+    assert get(api, "/analytics/employees/EMP0001/monthly", month="9999-12")["working_days"] > 0
+
+
+def test_rate_and_average_use_half_up(api, database):
+    for i in range(1, 33):
+        emp(database, f"EMP{i:04d}")
+    log(database, "EMP0001", "2026-07-06", work_hours=4.485)
+    row = get(api, "/analytics/departments/Eng/trend", **{"from": "2026-07-06", "to": "2026-07-06"})["items"][0]
+    assert row["attendance_rate"] == 0.0313 and row["moving_avg_7d"] == 0.0313
+    row = get(api, "/analytics/departments/summary", month="2026-07")["items"][0]
+    assert row["avg_work_hours"] == 4.49

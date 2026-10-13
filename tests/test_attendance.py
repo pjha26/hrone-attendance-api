@@ -126,3 +126,63 @@ def test_concurrent_regularizations_preserve_audit(api, database):
     assert codes.count(200) == 1
     assert set(codes) <= {200, 409, 422}
     assert len(database.attendance_logs.find_one({})["history"]) == 1
+
+
+@pytest.mark.parametrize("other", ["correction", "punch-out"])
+def test_overlapping_edits_reject_stale_state_and_retry_safely(api, database, monkeypatch, other):
+    employee(api)
+    start(api)
+    collection_type = type(database.attendance_logs)
+    original_update = collection_type.find_one_and_update
+    barrier = Barrier(2)
+
+    def gated_update(collection, *args, **kwargs):
+        if collection.full_name == database.attendance_logs.full_name:
+            barrier.wait(timeout=10)
+        return original_update(collection, *args, **kwargs)
+
+    monkeypatch.setattr(collection_type, "find_one_and_update", gated_update)
+    correction = {"punch_in": ms("2026-07-06T09:28:00"), "regularized_by": "HR", "reason": "correct clock"}
+    actions = [lambda: api.patch("/attendance/EMP0001/2026-07-06", json=correction)]
+    if other == "correction":
+        actions.append(lambda: api.patch("/attendance/EMP0001/2026-07-06", json={"status": "WFH", "regularized_by": "HR", "reason": "remote work"}))
+    else:
+        actions.append(lambda: api.post("/attendance/punch-out", json={"emp_code": "EMP0001", "punched_at": ms("2026-07-06T18:30:00")}))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda action: action(), actions))
+    assert sorted(response.status_code for response in results) == [200, 409]
+    before_retry = database.attendance_logs.find_one({})
+    monkeypatch.setattr(collection_type, "find_one_and_update", original_update)
+    loser = next(i for i, response in enumerate(results) if response.status_code == 409)
+    retry = actions[loser]()
+    assert retry.status_code == 200, retry.text
+    final = database.attendance_logs.find_one({})
+    assert len(final["history"]) == (2 if other == "correction" else 1)
+    assert epoch_millis(final["punch_in"]) == correction["punch_in"]
+    if other == "punch-out":
+        assert final["work_hours"] == 9.03 and final["late_minutes"] == 0
+    else:
+        for key, change in final["history"][-1]["changes"].items():
+            assert change["from"] == before_retry[key]
+            assert change["to"] == final[key]
+
+
+def test_health_database_failure(api, database, monkeypatch):
+    from pymongo.errors import ConnectionFailure
+    from app import main
+    class OfflineDatabase:
+        def command(self, *args):
+            raise ConnectionFailure("offline")
+    monkeypatch.setattr(main, "db", OfflineDatabase())
+    assert api.get("/health").status_code == 503
+
+
+def test_seeded_subseconds_are_truncated_before_calculation(api, database):
+    employee(api)
+    database.attendance_logs.insert_one({"emp_code": "EMP0001", "date": "2026-07-06", "status": "PRESENT",
+                                        "punch_in": datetime.fromisoformat("2026-07-06T09:30:00.900").replace(tzinfo=IST)})
+    result = api.post("/attendance/punch-out", json={"emp_code": "EMP0001", "punched_at": ms("2026-07-06T13:59:42")})
+    assert result.status_code == 200, result.text
+    assert result.json()["work_hours"] == 4.50 and result.json()["half_day"] is False
+    assert result.json()["punch_in"] % 1000 == 0
+    assert database.attendance_logs.find_one({})["punch_in"].microsecond == 0

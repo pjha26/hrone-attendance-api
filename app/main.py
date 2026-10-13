@@ -81,7 +81,7 @@ def valid_month(value: str) -> str:
 
 DateText = Annotated[str, AfterValidator(valid_date)]
 MonthText = Annotated[str, AfterValidator(valid_month)]
-ShiftTime = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
+ShiftTime = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 
 
 class RequestBody(BaseModel):
@@ -98,7 +98,7 @@ class RequestBody(BaseModel):
 
 
 class EmployeeIn(RequestBody):
-    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
     name: str = Field(min_length=1, max_length=100)
     email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     department: str = Field(min_length=1, max_length=50)
@@ -145,7 +145,7 @@ def instant(milliseconds):
 def epoch_millis(value):
     # Naive BSON dates are UTC, never the host's local timezone.
     value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-    delta = value - EPOCH
+    delta = value.replace(microsecond=0) - EPOCH
     return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
 
 
@@ -273,6 +273,12 @@ def validate_punch_pair(state):
             invalid("punch_out must be after punch_in and within 24 hours")
 
 
+def truncate_punches(state):
+    for key in ("punch_in", "punch_out"):
+        if state[key] is not None:
+            state[key] = state[key].replace(microsecond=0)
+
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
@@ -332,6 +338,7 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(409, "Already punched out")
     state = material_state(doc)
     state["punch_out"] = punch
+    truncate_punches(state)
     validate_punch_pair(state)
     state.update(derived_fields(state, employee, doc["date"]))
     updated = db.attendance_logs.find_one_and_update(snapshot_filter(doc), {"$set": state}, return_document=ReturnDocument.AFTER)
@@ -354,6 +361,7 @@ def regularize(emp_code: str, date: DateText, body: RegularizeIn):
     for key in ("punch_in", "punch_out"):
         if key in supplied:
             after[key] = instant(getattr(body, key))
+    truncate_punches(after)
     if after["status"] not in PRESENCE:
         if supplied & {"punch_in", "punch_out"}:
             invalid("ABSENT or LEAVE cannot be supplied with punch times")

@@ -14,5 +14,9 @@ application startup never seeds or deletes data.
 
 For tests, install `requirements-dev.txt` and run `python -m pytest`.
 
-Implementation progress: validation, UTC/IST calculations, serialization,
-startup indexes, and readiness are implemented. CRUD and analytics are next.
+Integration tests use `TEST_MONGO_URI` and create/drop a uniquely named test
+database. Without that variable, only database-independent tests run.
+
+Implementation progress: employee CRUD, attendance punches, corrections with
+an audit trail, startup indexes, and readiness are implemented. Analytics and
+explain are next.

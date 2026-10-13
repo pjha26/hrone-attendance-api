@@ -222,3 +222,149 @@ def health():
     except PyMongoError:
         raise HTTPException(503, "Database unavailable") from None
     return {"status": "ok"}
+
+
+def employee_or_404(emp_code):
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if employee is None:
+        raise HTTPException(404, "Employee not found")
+    return employee
+
+
+def attendance_query(emp_code=None, date_from=None, date_to=None, status=None):
+    if date_from is not None and date_to is not None and date_from > date_to:
+        invalid("date_from must not be after date_to", "query")
+    query = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+    hint = "attendance_employee_date" if emp_code is not None else (
+        "attendance_status_date" if status is not None else "attendance_date_employee"
+    )
+    return query, hint
+
+
+def snapshot_filter(doc):
+    # Compare both computed inputs and history length: stale edits cannot erase newer work.
+    expected = material_state(doc)
+    conditions = [{"$eq": [{"$ifNull": ["$" + key, MATERIAL_DEFAULTS[key]]}, {"$literal": value}]}
+                  for key, value in expected.items()]
+    conditions.append({"$eq": [{"$size": {"$ifNull": ["$history", []]}}, len(doc.get("history", []))]})
+    return {"emp_code": doc["emp_code"], "date": doc["date"], "$expr": {"$and": conditions}}
+
+
+def validate_punch_pair(state):
+    if state["punch_out"] is not None:
+        seconds = (state["punch_out"] - state["punch_in"]).total_seconds()
+        if seconds <= 0 or seconds > 86400:
+            invalid("punch_out must be after punch_in and within 24 hours")
+
+
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeIn):
+    doc = body.model_dump()
+    doc["created_at"] = now_utc()
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists") from None
+    return employee_output(doc)
+
+
+@app.get("/employees")
+def list_employees(department: str | None = None, page: Page = 1, page_size: PageSize = 20):
+    query = {} if department is None else {"department": department}
+    hint = "employee_code" if department is None else "employee_department_code"
+    total = db.employees.count_documents(query, hint=hint)
+    docs = db.employees.find(query, {"_id": 0}).hint(hint).sort("emp_code", 1).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [employee_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInIn):
+    employee = employee_or_404(body.emp_code)
+    punch = instant(body.punched_at)
+    day = attendance_date(punch, employee)
+    state = {"status": body.status, "punch_in": punch, "punch_out": None}
+    doc = {"emp_code": body.emp_code, "date": day, **state, **derived_fields(state, employee, day), "history": []}
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "Already punched in for this date") from None
+    return attendance_output(doc)
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: str | None = None, date_from: DateText | None = None, date_to: DateText | None = None,
+    status: Status | None = None, page: Page = 1, page_size: PageSize = 20,
+):
+    query, hint = attendance_query(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(query, hint=hint)
+    docs = db.attendance_logs.find(query, {"_id": 0}).hint(hint).sort([("date", -1), ("emp_code", 1)]).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [attendance_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    employee = employee_or_404(body.emp_code)
+    punch = instant(body.punched_at)
+    doc = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$type": "date", "$lte": punch}},
+        sort=[("punch_in", -1)], hint="attendance_employee_punch",
+    )
+    if doc is None:
+        raise HTTPException(404, "No punch-in found")
+    if doc.get("punch_out") is not None:
+        raise HTTPException(409, "Already punched out")
+    state = material_state(doc)
+    state["punch_out"] = punch
+    validate_punch_pair(state)
+    state.update(derived_fields(state, employee, doc["date"]))
+    updated = db.attendance_logs.find_one_and_update(snapshot_filter(doc), {"$set": state}, return_document=ReturnDocument.AFTER)
+    if updated is None:
+        raise HTTPException(409, "Attendance changed concurrently; retry")
+    return attendance_output(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: DateText, body: RegularizeIn):
+    employee = employee_or_404(emp_code)
+    doc = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if doc is None:
+        raise HTTPException(404, "Attendance record not found")
+    before = material_state(doc)
+    after = before.copy()
+    supplied = body.model_fields_set
+    if "status" in supplied:
+        after["status"] = body.status
+    for key in ("punch_in", "punch_out"):
+        if key in supplied:
+            after[key] = instant(getattr(body, key))
+    if after["status"] not in PRESENCE:
+        if supplied & {"punch_in", "punch_out"}:
+            invalid("ABSENT or LEAVE cannot be supplied with punch times")
+    else:
+        if after["punch_in"] is None:
+            invalid("Presence status requires punch_in")
+        if attendance_date(after["punch_in"], employee) != date:
+            invalid("punch_in must remain on the attendance date")
+        validate_punch_pair(after)
+    after.update(derived_fields(after, employee, date))
+    changes = {key: {"from": before[key], "to": value} for key, value in after.items() if before[key] != value}
+    if not changes:
+        invalid("Correction changes nothing")
+    history = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    updated = db.attendance_logs.find_one_and_update(
+        snapshot_filter(doc), {"$set": after, "$push": {"history": history}}, return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "Attendance changed concurrently; retry")
+    return attendance_output(updated)

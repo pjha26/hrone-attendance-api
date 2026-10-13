@@ -129,7 +129,7 @@ An optional local `.env` is loaded without overriding shell environment variable
 
 Open [the health check](http://localhost:8000/health) and [Swagger UI](http://localhost:8000/docs). Health returns `{"status":"ok"}` when MongoDB responds; a connectivity failure returns `503`.
 
-Swagger groups endpoints by purpose and includes request examples, success-response fields, and error codes. Its response schemas describe the existing JSON serializers; they do not change response handling.
+Swagger groups endpoints by purpose and includes request examples, success-response fields, and error codes. It uses system fonts and a compact layout; no font downloads are needed. Its response schemas describe the existing JSON serializers; they do not change response handling.
 
 ## API reference
 

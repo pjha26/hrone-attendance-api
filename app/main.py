@@ -11,8 +11,9 @@ from typing import Annotated, Literal
 
 from bson import Decimal128, json_util
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictInt, model_validator
 from pydantic.json_schema import SkipJsonSchema
 from pymongo import MongoClient, ReturnDocument
@@ -60,7 +61,7 @@ async def lifespan(app):
 
 
 app = FastAPI(
-    title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan,
+    title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan, docs_url=None,
     description="Manage attendance, correct records with an audit trail, and explore MongoDB analytics. "
                 "Instants use integer epoch milliseconds; dates and shift times use IST. "
                 "Start by creating an employee, then record a punch-in and punch-out.",
@@ -72,6 +73,44 @@ app = FastAPI(
         {"name": "admin", "description": "Inspect the execution plans used by list and analytics queries."},
     ],
 )
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_docs(request: Request):
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    html = get_swagger_ui_html(
+        openapi_url=root_path + app.openapi_url, title=app.title + " - Swagger UI",
+        swagger_ui_parameters=app.swagger_ui_parameters,
+    )
+    style = """<style>
+    body { margin: 0; background: #fff; }
+    .swagger-ui { font-family: "Segoe UI", system-ui, sans-serif; color: #243246; line-height: 1.5; }
+    .swagger-ui * { font-family: inherit; }
+    .swagger-ui code, .swagger-ui pre, .swagger-ui textarea, .swagger-ui .opblock-summary-path {
+        font-family: Consolas, "Liberation Mono", monospace;
+    }
+    .swagger-ui .wrapper { max-width: 1160px; padding: 0 24px; }
+    .swagger-ui .info { margin: 40px 0 28px; }
+    .swagger-ui .info .title { font-size: clamp(24px, 2.5vw, 32px); font-weight: 600; letter-spacing: -.5px; line-height: 1.3; }
+    .swagger-ui .info .title small { font-size: 12px; vertical-align: middle; }
+    .swagger-ui .info .description { max-width: 80ch; }
+    .swagger-ui .info p { font-size: 14px; line-height: 1.7; }
+    .swagger-ui .opblock-tag { font-size: 20px; font-weight: 600; padding: 14px 10px; margin: 22px 0 12px; }
+    .swagger-ui .opblock-tag small { font-size: 14px; font-weight: 400; color: #526176; }
+    .swagger-ui .opblock { border-radius: 8px; box-shadow: none; margin-bottom: 12px; }
+    .swagger-ui .opblock .opblock-summary { padding: 8px 10px; }
+    .swagger-ui .opblock .opblock-summary-method { font-size: 12px; min-width: 72px; }
+    .swagger-ui .opblock .opblock-summary-path { font-size: 14px; }
+    .swagger-ui .opblock .opblock-summary-description { font-size: 14px; }
+    .swagger-ui .btn, .swagger-ui input, .swagger-ui select { border-radius: 6px; }
+    .swagger-ui textarea { line-height: 1.6; }
+    @media (max-width: 640px) {
+        .swagger-ui .wrapper { padding: 0 14px; }
+        .swagger-ui .opblock-tag { flex-wrap: wrap; gap: 6px; }
+        .swagger-ui .opblock-tag small { padding-left: 0; }
+    }
+    </style>"""
+    return HTMLResponse(html.body.decode("utf-8").replace("</head>", style + "</head>"))
 
 
 @app.exception_handler(PyMongoError)

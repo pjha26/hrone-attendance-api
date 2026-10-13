@@ -50,8 +50,8 @@ def create_indexes():
 
 @asynccontextmanager
 async def lifespan(app):
-    create_indexes()
     try:
+        create_indexes()
         yield
     finally:
         client.close()
@@ -251,6 +251,12 @@ def attendance_query(emp_code=None, date_from=None, date_to=None, status=None):
     return query, hint
 
 
+def attendance_find_command(emp_code=None, date_from=None, date_to=None, status=None, page=1, page_size=20):
+    query, hint = attendance_query(emp_code, date_from, date_to, status)
+    return {"find": "attendance_logs", "filter": query, "projection": {"_id": 0},
+            "sort": {"date": -1, "emp_code": 1}, "skip": (page - 1) * page_size, "limit": page_size, "hint": hint}
+
+
 def snapshot_filter(doc):
     # Compare both computed inputs and history length: stale edits cannot erase newer work.
     expected = material_state(doc)
@@ -306,9 +312,9 @@ def list_attendance(
     emp_code: str | None = None, date_from: DateText | None = None, date_to: DateText | None = None,
     status: Status | None = None, page: Page = 1, page_size: PageSize = 20,
 ):
-    query, hint = attendance_query(emp_code, date_from, date_to, status)
-    total = db.attendance_logs.count_documents(query, hint=hint)
-    docs = db.attendance_logs.find(query, {"_id": 0}).hint(hint).sort([("date", -1), ("emp_code", 1)]).skip((page - 1) * page_size).limit(page_size)
+    command = attendance_find_command(emp_code, date_from, date_to, status, page, page_size)
+    total = db.attendance_logs.count_documents(command["filter"], hint=command["hint"])
+    docs = db.attendance_logs.find(command["filter"], command["projection"]).hint(command["hint"]).sort(list(command["sort"].items())).skip(command["skip"]).limit(command["limit"])
     return {"items": [attendance_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
 
 
@@ -499,24 +505,30 @@ def trend_range(first, last):
 def department_trend_pipeline(department, first, last):
     days = trend_range(first, last)
     return [
-        {"$match": {"department": department}}, {"$limit": 1},
-        {"$project": {"_id": 0, "day": {"$map": {
-            "input": {"$range": [0, days]}, "as": "offset",
-            "in": {"$dateAdd": {"startDate": calendar_instant(first), "unit": "day", "amount": "$$offset"}},
-        }}}},
+        {"$match": {"department": department}},
+        {"$facet": {
+            "joins": [{"$group": {"_id": "$joined_on", "count": {"$sum": 1}}}],
+            "daily": [
+                {"$lookup": {"from": "attendance_logs", "localField": "emp_code", "foreignField": "emp_code", "pipeline": [
+                    {"$match": {"date": {"$gte": first, "$lte": last}}},
+                    {"$group": {"_id": "$date", "present_count": {"$sum": present_weight()}, "late_count": {"$sum": {"$cond": [positive_late(), 1, 0]}}}},
+                ], "as": "days"}},
+                {"$unwind": "$days"},
+                {"$group": {"_id": "$days._id", "present_count": {"$sum": "$days.present_count"}, "late_count": {"$sum": "$days.late_count"}}},
+            ],
+            "calendar": [{"$limit": 1}, {"$project": {"_id": 0, "days": {"$map": {
+                "input": {"$range": [0, days]}, "as": "offset",
+                "in": {"$dateAdd": {"startDate": calendar_instant(first), "unit": "day", "amount": "$$offset"}},
+            }}}}],
+        }},
+        {"$set": {"day": {"$ifNull": [{"$arrayElemAt": ["$calendar.days", 0]}, []]}}},
         {"$unwind": "$day"},
         {"$set": {"date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}}, "is_working_day": weekday("$day")}},
-        {"$lookup": {"from": "employees", "let": {"day": "$date"}, "pipeline": [
-            {"$match": {"department": department, "$expr": {"$lte": ["$joined_on", "$$day"]}}}, {"$count": "count"},
-        ], "as": "head"}},
-        {"$lookup": {"from": "attendance_logs", "let": {"day": "$date"}, "pipeline": [
-            {"$match": {"$expr": {"$eq": ["$date", "$$day"]}}},
-            {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "pipeline": [{"$match": {"department": department}}], "as": "employee"}},
-            {"$match": {"employee.0": {"$exists": True}}},
-            {"$group": {"_id": None, "present_count": {"$sum": present_weight()}, "late_count": {"$sum": {"$cond": [positive_late(), 1, 0]}}}},
-        ], "as": "stats"}},
-        {"$set": {"headcount": {"$ifNull": [{"$arrayElemAt": ["$head.count", 0]}, 0]},
-                  "present_count": stats_value("present_count"), "late_count": stats_value("late_count")}},
+        {"$set": {
+            "headcount": {"$sum": {"$map": {"input": {"$filter": {"input": "$joins", "as": "join", "cond": {"$lte": ["$$join._id", "$date"]}}}, "as": "join", "in": "$$join.count"}}},
+            "stats": {"$arrayElemAt": [{"$filter": {"input": "$daily", "as": "row", "cond": {"$eq": ["$$row._id", "$date"]}}}, 0]},
+        }},
+        {"$set": {"present_count": {"$ifNull": ["$stats.present_count", 0]}, "late_count": {"$ifNull": ["$stats.late_count", 0]}}},
         {"$set": {"attendance_rate": {"$cond": ["$is_working_day", mongo_half_up(ratio("$present_count", "$headcount"), 4), None]}}},
         {"$setWindowFields": {"sortBy": {"date": 1}, "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}}},
         {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count": 1, "attendance_rate": 1,
@@ -573,3 +585,27 @@ def department_trend(department: str, first: Annotated[DateText, Query(alias="fr
     if not rows:
         raise HTTPException(404, "Department not found")
     return {"department": department, "items": json_value(rows)}
+
+
+ExplainEndpoint = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainEndpoint, emp_code: str | None = None, month: MonthText | None = None,
+    department: str | None = None, limit: Limit = 10,
+    date_from: DateText | None = None, date_to: DateText | None = None, status: Status | None = None,
+    first: Annotated[DateText | None, Query(alias="from")] = None,
+    last: Annotated[DateText | None, Query(alias="to")] = None,
+    page: Page = 1, page_size: PageSize = 20,
+):
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = attendance_find_command(emp_code, date_from, date_to, status, page, page_size)
+    else:
+        collection, pipeline, hint = aggregation_operation(
+            endpoint, emp_code=emp_code, month=month, department=department, limit=limit, first=first, last=last,
+        )
+        command = {"aggregate": collection, "pipeline": pipeline, "hint": hint, "cursor": {}}
+    explanation = db.command({"explain": command, "verbosity": "executionStats"})
+    return {"endpoint": endpoint, "collection": collection, "explain": json_value(explanation)}

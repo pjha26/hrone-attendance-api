@@ -17,5 +17,5 @@ For tests, install `requirements-dev.txt` and run `python -m pytest`.
 Integration tests use `TEST_MONGO_URI` and create/drop a uniquely named test
 database. Without that variable, only database-independent tests run.
 
-Implementation progress: all attendance and analytics endpoints are implemented.
-The explain endpoint, final scale checks, and submission documentation are next.
+All required endpoints, including executionStats explain, are implemented.
+Final scale verification and submission documentation are in progress.

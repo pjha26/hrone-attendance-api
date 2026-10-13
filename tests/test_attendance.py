@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 from threading import Barrier
 
 import pytest
@@ -186,3 +186,17 @@ def test_seeded_subseconds_are_truncated_before_calculation(api, database):
     assert result.json()["work_hours"] == 4.50 and result.json()["half_day"] is False
     assert result.json()["punch_in"] % 1000 == 0
     assert database.attendance_logs.find_one({})["punch_in"].microsecond == 0
+
+
+@pytest.mark.parametrize("path", ["/employees", "/attendance", "/admin/explain/attendance_list"])
+def test_large_positive_page_preserves_empty_page_and_explain(api, database, path):
+    employee(api)
+    start(api)
+    page = 2**63
+    result = api.get(path, params={"page": str(page), "page_size": 100})
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    if path.startswith("/admin"):
+        assert payload["explain"]["command"]["skip"] == 2**63 - 1
+    else:
+        assert payload == {"items": [], "total": 1, "page": page, "page_size": 100}

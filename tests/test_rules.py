@@ -78,3 +78,46 @@ def test_contract_validation_and_ignored_derived_fields():
         valid_date("2026-7-01")
     with pytest.raises(ValueError):
         valid_month("0000-07")
+
+
+def test_explain_preserves_bson_replica_metadata(monkeypatch):
+    from bson import Binary, Decimal128, Timestamp
+    from fastapi.testclient import TestClient
+    from app import main
+
+    raw = {
+        "queryPlanner": {"winningPlan": {"stage": "IXSCAN"}},
+        "executionStats": {"nReturned": 0},
+        "operationTime": Timestamp(10, 2),
+        "$clusterTime": {"clusterTime": Timestamp(10, 2), "signature": {"hash": Binary(b"\xff\x00"), "keyId": 5}},
+        "command": {"pipeline": [{"$project": {"value": Decimal128("0.5")}}]},
+    }
+    class Database:
+        def command(self, command):
+            assert command["verbosity"] == "executionStats"
+            return raw
+    monkeypatch.setattr(main, "db", Database())
+    http = TestClient(main.app)
+    try:
+        response = http.get("/admin/explain/attendance_list")
+    finally:
+        http.close()
+    assert response.status_code == 200
+    explanation = response.json()["explain"]
+    assert explanation["operationTime"] == {"$timestamp": {"t": 10, "i": 2}}
+    assert explanation["$clusterTime"]["signature"]["hash"] == {"$binary": {"base64": "/wA=", "subType": "00"}}
+    assert explanation["command"]["pipeline"][0]["$project"]["value"] == {"$numberDecimal": "0.5"}
+    assert explanation["queryPlanner"]["winningPlan"]["stage"] == "IXSCAN"
+
+
+def test_openapi_optional_request_fields_do_not_allow_null():
+    from app.main import app
+    schemas = app.openapi()["components"]["schemas"]
+    for name, fields in {"PunchInIn": ["punched_at"], "PunchOutIn": ["punched_at"], "RegularizeIn": ["status", "punch_in", "punch_out"]}.items():
+        schema = schemas[name]
+        for field in fields:
+            prop = schema["properties"][field]
+            assert field not in schema["required"]
+            assert prop.get("type") != "null"
+            assert not any(option.get("type") == "null" for option in prop.get("anyOf", []))
+    assert schemas["PunchInIn"]["properties"]["status"]["default"] == "PRESENT"

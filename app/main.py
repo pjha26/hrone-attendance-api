@@ -1,6 +1,7 @@
 """Attendance API. Calendar values use IST; stored instants use UTC."""
 
 import calendar
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -8,11 +9,12 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal
 
-from bson import Decimal128, ObjectId
+from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -115,7 +117,7 @@ class EmployeeIn(RequestBody):
 
 class PunchOutIn(RequestBody):
     emp_code: str
-    punched_at: EpochMillis | None = None
+    punched_at: EpochMillis | SkipJsonSchema[None] = None
 
 
 class PunchInIn(PunchOutIn):
@@ -123,9 +125,9 @@ class PunchInIn(PunchOutIn):
 
 
 class RegularizeIn(RequestBody):
-    status: Status | None = None
-    punch_in: EpochMillis | None = None
-    punch_out: EpochMillis | None = None
+    status: Status | SkipJsonSchema[None] = None
+    punch_in: EpochMillis | SkipJsonSchema[None] = None
+    punch_out: EpochMillis | SkipJsonSchema[None] = None
     reason: str = Field(min_length=5, max_length=200)
     regularized_by: str = Field(min_length=1, max_length=50)
 
@@ -146,7 +148,7 @@ def epoch_millis(value):
     # Naive BSON dates are UTC, never the host's local timezone.
     value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
     delta = value.replace(microsecond=0) - EPOCH
-    return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
+    return delta.days * 86400000 + delta.seconds * 1000
 
 
 def json_value(value):
@@ -154,10 +156,6 @@ def json_value(value):
         return epoch_millis(value)
     if isinstance(value, Decimal128):
         return float(value.to_decimal())
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, ObjectId):
-        return str(value)
     if isinstance(value, dict):
         return {key: json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -254,7 +252,12 @@ def attendance_query(emp_code=None, date_from=None, date_to=None, status=None):
 def attendance_find_command(emp_code=None, date_from=None, date_to=None, status=None, page=1, page_size=20):
     query, hint = attendance_query(emp_code, date_from, date_to, status)
     return {"find": "attendance_logs", "filter": query, "projection": {"_id": 0},
-            "sort": {"date": -1, "emp_code": 1}, "skip": (page - 1) * page_size, "limit": page_size, "hint": hint}
+            "sort": {"date": -1, "emp_code": 1}, "skip": page_offset(page, page_size), "limit": page_size, "hint": hint}
+
+
+def page_offset(page, page_size):
+    # MongoDB encodes skip as int64; larger offsets still mean an empty page.
+    return min((page - 1) * page_size, 2**63 - 1)
 
 
 def snapshot_filter(doc):
@@ -295,7 +298,7 @@ def list_employees(department: str | None = None, page: Page = 1, page_size: Pag
     query = {} if department is None else {"department": department}
     hint = "employee_code" if department is None else "employee_department_code"
     total = db.employees.count_documents(query, hint=hint)
-    docs = db.employees.find(query, {"_id": 0}).hint(hint).sort("emp_code", 1).skip((page - 1) * page_size).limit(page_size)
+    docs = db.employees.find(query, {"_id": 0}).hint(hint).sort("emp_code", 1).skip(page_offset(page, page_size)).limit(page_size)
     return {"items": [employee_output(doc) for doc in docs], "total": total, "page": page, "page_size": page_size}
 
 
@@ -616,4 +619,6 @@ def explain_endpoint(
         )
         command = {"aggregate": collection, "pipeline": pipeline, "hint": hint, "cursor": {}}
     explanation = db.command({"explain": command, "verbosity": "executionStats"})
-    return {"endpoint": endpoint, "collection": collection, "explain": json_value(explanation)}
+    # Replica-set responses include BSON timestamps and binary signatures.
+    safe_explanation = json.loads(json_util.dumps(explanation, json_options=json_util.RELAXED_JSON_OPTIONS))
+    return {"endpoint": endpoint, "collection": collection, "explain": safe_explanation}

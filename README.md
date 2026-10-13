@@ -218,7 +218,7 @@ Department trends aggregate attendance by employee and date, generate the reques
 
 Startup creates unique identity indexes and compound indexes for department/join-date queries, date ordering, status-filtered lists, and latest punch-in lookup. [DECISIONS.md](DECISIONS.md) explains the choices; [REVIEW.md](REVIEW.md) records the starter defects and fixes.
 
-The explain endpoint supports `attendance_list`, `employee_monthly`, `department_summary`, `late_leaderboard`, and `department_trend`. It accepts the selected endpoint's parameters and returns `{endpoint, collection, explain}` with raw MongoDB `executionStats` output.
+The explain endpoint supports `attendance_list`, `employee_monthly`, `department_summary`, `late_leaderboard`, and `department_trend`. It accepts the selected endpoint's parameters and returns `{endpoint, collection, explain}` with raw MongoDB `executionStats` output. BSON-only values such as replica-set timestamps and binary signatures use MongoDB Extended JSON; normal attendance responses continue to use numeric epoch milliseconds.
 
 ## Testing
 
@@ -240,11 +240,11 @@ export TEST_MONGO_URI="mongodb://127.0.0.1:27017"
 .venv/bin/python -m pytest -q
 ```
 
-The current suite contains **46 tests**. Without `TEST_MONGO_URI`, integration tests are skipped. Integration tests create and drop a uniquely named `hrone_test_<uuid>` database, separate from `MONGO_DB`; the connection needs permission to create indexes and remove that test database.
+The current suite contains **51 tests**. Without `TEST_MONGO_URI`, integration tests are skipped. Integration tests create and drop a uniquely named `hrone_test_<uuid>` database, separate from `MONGO_DB`; the connection needs permission to create indexes and remove that test database.
 
 Coverage includes strict input validation, time and rounding boundaries, overnight shifts, pagination, duplicate request races, overlapping corrections, audit preservation, zero-log employees, joiners, weekend records, ranking ties, empty trends, and moving averages. The scale test generates 100,000 records, rebuilds indexes, and checks all five explain targets for indexed access without collection scans.
 
-Previous verification passed all 46 tests on MongoDB 7, including a clean dependency installation and live API smoke checks. Hidden evaluator tests have not been run.
+Verification passed all 51 tests on both standalone MongoDB 7 and a local MongoDB 7 replica set. Earlier checks also covered a clean dependency installation and live API smoke requests. Hidden evaluator tests have not been run.
 
 ## Repository structure
 

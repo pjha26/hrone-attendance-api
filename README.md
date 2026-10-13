@@ -1,5 +1,7 @@
 # Employee Attendance and Analytics API
 
+[![Tests](https://github.com/pjha26/hrone-attendance-api/actions/workflows/ci.yml/badge.svg)](https://github.com/pjha26/hrone-attendance-api/actions/workflows/ci.yml)
+
 A Python API for managing employee attendance and answering attendance questions with MongoDB aggregations. It supports punch-in and punch-out, manual corrections with an audit trail, monthly summaries, late rankings, and daily department trends.
 
 **Stack:** Python 3.11+, FastAPI, Pydantic v2, synchronous PyMongo, and MongoDB 6.0+. Integration and scale checks were run against MongoDB 7.
@@ -246,9 +248,16 @@ Coverage includes strict input validation, time and rounding boundaries, overnig
 
 Verification passed all 51 tests on both standalone MongoDB 7 and a local MongoDB 7 replica set. Earlier checks also covered a clean dependency installation and live API smoke requests. Hidden evaluator tests have not been run.
 
+### Continuous integration
+
+[GitHub Actions](https://github.com/pjha26/hrone-attendance-api/actions/workflows/ci.yml) runs the full suite on pushes to `main`, pull requests, and manual runs. Each job uses Python 3.11 or 3.12 with a disposable MongoDB 7.0.14 service container, checks installed dependencies, and executes all tests, including integration, concurrency, and the 100,000-record index checks. The service is health-checked before the job starts, so database tests are not skipped.
+
+Docker is optional for local MongoDB and is used only for the CI database service. The API runs directly with Uvicorn; the submission intentionally contains no Dockerfile.
+
 ## Repository structure
 
 ```text
+.github/workflows/ci.yml   Python and MongoDB CI checks
 app/
   __init__.py
   main.py                 Application, rules, indexes, and pipeline builders
